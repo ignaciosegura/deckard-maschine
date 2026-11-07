@@ -13,6 +13,7 @@ use eframe::egui::{self, Align2, Color32, ColorImage, Id, Rect, RichText, Sense,
 pub const WIDTH: f32 = 300.0;
 const ACCENT: Color32 = Color32::from_rgb(0xF3, 0x9C, 0x12);
 const RESULT_ROW: f32 = 20.0;
+const CHIPS_MAX_HEIGHT: f32 = 88.0;
 /// Splice's lockup (symbol and wordmark), black on transparent, 944 × 288.
 const SPLICE_LOGO: &[u8] = include_bytes!("../../assets/splice-logo.png");
 const SPLICE_BUTTON_HEIGHT: f32 = 36.0;
@@ -93,7 +94,7 @@ fn library(app: &App, ui: &mut Ui, acts: &mut Vec<Act>) {
     }
     // Types: the chosen path (click a level to go back to it), then the next level.
     label(ui, "TYPES");
-    ui.horizontal_wrapped(|ui| {
+    chip_scroll(ui, "browser-types", |ui| {
         if !q.types.is_empty() && chip(ui, "All", false, 11.0).clicked() {
             acts.push(Act::Browse(BrowseAct::Types(Vec::new())));
         }
@@ -113,7 +114,7 @@ fn library(app: &App, ui: &mut Ui, acts: &mut Vec<Act>) {
         }
     });
     label(ui, "CHARACTERS");
-    ui.horizontal_wrapped(|ui| {
+    chip_scroll(ui, "browser-characters", |ui| {
         let mut shown: Vec<(String, Option<usize>)> = b.results.characters.iter().map(|(c, n)| (c.clone(), Some(*n))).collect();
         // A chosen character stays shown even when nothing left has it.
         for c in &q.characters {
@@ -142,7 +143,12 @@ fn library(app: &App, ui: &mut Ui, acts: &mut Vec<Act>) {
     } else {
         format!("{n} results")
     };
-    ui.label(RichText::new(status).size(10.0).color(white(142)));
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(status).size(10.0).color(white(142)));
+        if ui.button("Refresh").on_hover_text("Scan the library again, including expansions installed since DECKARD opened").clicked() {
+            acts.push(Act::Browse(BrowseAct::Rescan));
+        }
+    });
     // Nothing matched: offer Splice, searched for the same words.
     if n == 0 && !b.waiting() && !q.text.trim().is_empty() {
         splice_line(ui, &format!("Nothing here for \"{}\". Find it on Splice ↗", q.text.trim()), Some(&q.text));
@@ -284,6 +290,25 @@ fn files(app: &App, ui: &mut Ui, acts: &mut Vec<Act>) {
         }
         ui.add(egui::Label::new(RichText::new(format!("📁 {}", b.files_dir.display())).size(10.0).color(white(180))).truncate());
     });
+    // Type or paste a path, then Enter. Clicking a folder clears whatever was typed.
+    let path_id = Id::new("files-path");
+    let mut draft = ui.ctx().data(|d| d.get_temp::<String>(path_id)).unwrap_or_else(|| b.files_dir.display().to_string());
+    let edit = ui.add(
+        egui::TextEdit::singleline(&mut draft).id(path_id).desired_width(ui.available_width()).hint_text("Paste a folder path, then Enter"),
+    );
+    if edit.changed() {
+        let typed = draft.clone();
+        ui.ctx().data_mut(|d| d.insert_temp(path_id, typed));
+    }
+    if !edit.has_focus() {
+        ui.ctx().data_mut(|d| d.remove::<String>(path_id));
+    }
+    if edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+        let path = std::path::PathBuf::from(draft.trim());
+        if !path.as_os_str().is_empty() {
+            acts.push(Act::Browse(BrowseAct::Folder(path)));
+        }
+    }
     let height = (ui.available_height() - 34.0).max(60.0);
     egui::ScrollArea::vertical().max_height(height).auto_shrink([false, false]).show_rows(ui, RESULT_ROW, b.files.len(), |ui, rows| {
         for i in rows {
@@ -354,6 +379,12 @@ pub(super) fn chip(ui: &mut Ui, text: &str, on: bool, size: f32) -> egui::Respon
     ui.painter().rect_filled(r, 9.0, fill);
     ui.painter().galley(r.center() - galley.size() / 2.0, galley, Color32::WHITE);
     resp
+}
+
+fn chip_scroll(ui: &mut Ui, id: &str, add: impl FnOnce(&mut Ui)) {
+    egui::ScrollArea::vertical().id_salt(id).max_height(CHIPS_MAX_HEIGHT).auto_shrink([false, true]).show(ui, |ui| {
+        ui.horizontal_wrapped(add);
+    });
 }
 
 fn label(ui: &mut Ui, text: &str) {

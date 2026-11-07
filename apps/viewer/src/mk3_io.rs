@@ -8,7 +8,7 @@ use deckard_engine::output::Sender;
 use deckard_mk3::Event;
 use deckard_model::pad_touch::{PadTouch, TouchMode};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Where pads play: the scripts' focus, kept up to date by the app.
 #[derive(Clone, Copy)]
@@ -226,10 +226,15 @@ struct Shared {
     /// What the displays should show: both side by side, 960 × 272 RGBA, and its number.
     screens: Option<(u64, Arc<Vec<[u8; 4]>>)>,
     display_status: String,
-    /// An MK3 is plugged in, its screens won't open, and NI's agent is running.
+    /// An MK3 is plugged in, and NI's software is why its screens won't open.
     agent_holding: bool,
+    /// Leave the screens alone, as they're being given back to NI's driver.
+    displays_released: bool,
     /// The displays' backlight, 0..=100 (`set_display_brightness`).
     display_brightness: Option<u8>,
+    /// Bumped whenever that level must be written again: it changed, or the screens
+    /// came back (a driver change leaves the panels at their own 20%).
+    brightness_stamp: u64,
     /// DECKARD is closing: dark LEDs, the goodbye picture on the displays, then stop
     /// (`shut_down`).
     closing: bool,
@@ -294,7 +299,9 @@ impl Mk3Io {
 
     /// Set the displays' backlight (0..=100), now and whenever an MK3 connects.
     pub fn set_display_brightness(&self, level: u8) {
-        self.shared.lock().unwrap().display_brightness = Some(level.min(100));
+        let mut s = self.shared.lock().unwrap();
+        s.display_brightness = Some(level.min(100));
+        s.brightness_stamp = s.brightness_stamp.wrapping_add(1);
     }
 
     pub fn set_context(&self, ctx: &eframe::egui::Context) {
@@ -340,9 +347,27 @@ impl Mk3Io {
         std::mem::take(&mut self.shared.lock().unwrap().events)
     }
 
-    /// Whether NI's agent is keeping the MK3's screens from opening.
+    /// Whether NI's software is keeping the MK3's screens from opening.
     pub fn agent_holding(&self) -> bool {
         self.shared.lock().unwrap().agent_holding
+    }
+
+    /// Whether the MK3's screens are open.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub fn displays_connected(&self) -> bool {
+        self.shared.lock().unwrap().displays_connected
+    }
+
+    /// Let go of the screens and leave them alone (they're being given back to NI's
+    /// driver), or take them up again.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub fn release_displays(&self, released: bool) {
+        self.shared.lock().unwrap().displays_released = released;
+    }
+
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub fn displays_released(&self) -> bool {
+        self.shared.lock().unwrap().displays_released
     }
 
     /// Pad hits for the app to play itself (no engine was running).
@@ -363,14 +388,16 @@ fn run(shared: &Mutex<Shared>) {
         };
         {
             let mut s = shared.lock().unwrap();
-            s.status = "Maschine MK3 connected".into();
+            s.status = format!("{} connected", dev.model().name);
             s.connected = true;
         }
         let mut events = Vec::new();
         // Shown on the LEDs: none yet, so the first state is sent.
         let mut shown = None;
-        // The backlight as last set on this connection.
-        let mut brightness = None;
+        // The backlight write that succeeded, so a failed one is tried again and a
+        // screen reconnect (a new stamp) is sent even when the level did not change.
+        let mut applied_stamp = 0u64;
+        let mut brightness_retry = Instant::now();
         // What each pad started, so it stops the same note however the route changed
         // (a chord's first note; its others in `chord_rest`).
         let mut sounding: [Option<(usize, usize, i64)>; 16] = [None; 16];
@@ -389,14 +416,21 @@ fn run(shared: &Mutex<Shared>) {
                 s.connected = false;
                 break;
             }
-            let wanted = shared.lock().unwrap().display_brightness;
-            if wanted.is_some() && wanted != brightness {
-                if let Some(level) = wanted
-                    && let Err(e) = dev.set_display_brightness(level)
-                {
-                    shared.lock().unwrap().display_status = format!("display brightness: {e}");
+            let (wanted, stamp) = {
+                let s = shared.lock().unwrap();
+                (s.display_brightness, s.brightness_stamp)
+            };
+            if let Some(level) = wanted
+                && stamp != applied_stamp
+                && Instant::now() >= brightness_retry
+            {
+                match dev.set_display_brightness(level) {
+                    Ok(()) => applied_stamp = stamp,
+                    Err(e) => {
+                        shared.lock().unwrap().display_status = format!("display brightness: {e}");
+                        brightness_retry = Instant::now() + Duration::from_secs(1);
+                    }
                 }
-                brightness = wanted;
             }
             let leds = shared.lock().unwrap().leds.clone();
             if leds.is_some() && leds != shown {
@@ -528,10 +562,19 @@ fn set_agent_holding(s: &mut Shared, holding: bool) {
 fn run_displays(shared: &Mutex<Shared>) {
     use deckard_mk3::display::{Displays, HEIGHT, WIDTH, rgb565};
     loop {
+        {
+            let mut s = shared.lock().unwrap();
+            if s.displays_released {
+                set_agent_holding(&mut s, false);
+                drop(s);
+                std::thread::sleep(Duration::from_millis(200));
+                continue;
+            }
+        }
         let mut d = match Displays::open() {
             Ok(d) => d,
             Err(e) => {
-                let holding = e != deckard_mk3::display::NO_MK3 && crate::ni_agent::running();
+                let holding = crate::ni_agent::holding(&e);
                 let mut s = shared.lock().unwrap();
                 s.display_status = e;
                 set_agent_holding(&mut s, holding);
@@ -544,6 +587,8 @@ fn run_displays(shared: &Mutex<Shared>) {
             let mut s = shared.lock().unwrap();
             s.display_status.clear();
             s.displays_connected = true;
+            // The panels forget their backlight when the screen driver changes.
+            s.brightness_stamp = s.brightness_stamp.wrapping_add(1);
             set_agent_holding(&mut s, false);
         }
         let mut shown = None;
@@ -559,10 +604,14 @@ fn run_displays(shared: &Mutex<Shared>) {
                 }
                 out
             };
-            let closing = {
+            let (closing, released) = {
                 let s = shared.lock().unwrap();
-                s.closing.then(|| s.goodbye.clone())
+                (s.closing.then(|| s.goodbye.clone()), s.displays_released)
             };
+            if released && closing.is_none() {
+                shared.lock().unwrap().displays_connected = false;
+                break;
+            }
             if let Some(goodbye) = closing {
                 let px = goodbye.map_or_else(Vec::new, |p| p.to_vec());
                 let _ = d.show(0, &half(&px, 0)).and_then(|_| d.show(1, &half(&px, WIDTH)));
@@ -583,6 +632,8 @@ fn run_displays(shared: &Mutex<Shared>) {
                 _ => std::thread::sleep(Duration::from_millis(8)),
             }
         }
+        // Let go now: the screens' driver may be about to change.
+        drop(d);
         std::thread::sleep(Duration::from_secs(1));
     }
 }

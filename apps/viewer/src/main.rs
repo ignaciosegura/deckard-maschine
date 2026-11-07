@@ -1513,6 +1513,7 @@ impl App {
             return;
         }
         let path = d.path().map(Path::to_path_buf);
+        self.remember_libraries();
         if let Some(sample) = self.samples.sample(&z.sample, path.as_deref()) {
             self.waveform = Some(sampler_ui::Waveform::new(key, &sample.frames, sample.rate));
         }
@@ -2130,6 +2131,10 @@ impl App {
     /// switched off), and what sounds set to the Default MIDI source take.
     fn midi_preferences(&mut self, ui: &mut egui::Ui) {
         self.sync_preferences(ui);
+        ui.checkbox(&mut self.settings.focus_follows, "Focus the group MIDI is recorded into").on_hover_text(
+            "While recording, MIDI going into another group makes it the focused group. Off: the focus stays where you put it, and the MIDI still records into its group.",
+        );
+        ui.separator();
         let (ins, outs) = self.midi_ports().clone();
         for (title, ports, prefix) in [("Inputs", &ins, "in:"), ("Outputs", &outs, "out:")] {
             ui.label(egui::RichText::new(title).strong());
@@ -2379,6 +2384,37 @@ impl App {
                     ui.label("");
                     ui.label(egui::RichText::new("How hard the MK3's pads must be pressed: higher, gentle presses play louder.").weak());
                     ui.end_row();
+                    ui.label("Screen brightness");
+                    let mut brightness = self.settings.display_brightness;
+                    if ui.add(egui::Slider::new(&mut brightness, 0..=100).suffix(" %")).changed() {
+                        self.settings.display_brightness = brightness;
+                        if let Some(m) = &self.mk3 {
+                            m.set_display_brightness(brightness);
+                        }
+                    }
+                    ui.end_row();
+                    ui.label("");
+                    ui.label(egui::RichText::new("The backlight of the controller's screens.").weak());
+                    ui.end_row();
+                    if cfg!(windows)
+                        && let Some(mk3) = &self.mk3
+                    {
+                        ui.label("Controller screens");
+                        if mk3.displays_released() {
+                            if ui.button("Use in DECKARD").clicked() {
+                                mk3.release_displays(false);
+                            }
+                        } else if mk3.displays_connected() {
+                            if ui.button("Give Back to NI's Driver").on_hover_text("For Maschine and NI's other software, which can't use the screens while DECKARD's driver has them. Asks for administrator approval.").clicked() {
+                                mk3.release_displays(true);
+                                ni_agent::give_back();
+                                self.status = "giving the controller's screens back to NI's driver".into();
+                            }
+                        } else {
+                            ui.label(egui::RichText::new("Not open").weak());
+                        }
+                        ui.end_row();
+                    }
                     ui.label("Controller");
                     use settings::ControllerChoice as C;
                     let mut choice = self.settings.controller;
@@ -2674,6 +2710,10 @@ impl App {
         }
         self.stems_offer_dialog(ctx);
         let holding = self.mk3.as_ref().is_some_and(mk3_io::Mk3Io::agent_holding);
+        if let Some(failure) = ni_agent::take_failure() {
+            self.status = failure;
+            self.ni_agent = ni_agent::Ask::Declined;
+        }
         ni_agent::dialog(ctx, &mut self.ni_agent, holding, &mut self.status, ni_agent::quit);
         self.preferences(ctx);
         if self.about.is_some() && !about::show(self, ctx) {
@@ -2699,6 +2739,7 @@ impl App {
         self.headroom.clear();
         let d = doc.borrow();
         let project = d.project();
+        self.remember_libraries();
         let out = match self.output.get_or_insert_with(|| open_output(&self.settings, &mut self.output_fallback)) {
             Ok(out) => out,
             Err(e) => {
@@ -2736,6 +2777,9 @@ impl App {
         }
         if !report.no_sampler.is_empty() {
             status += &format!("; not played (drum synths aren't rendered yet): {}", report.no_sampler.join(", "));
+        }
+        if !report.missing.is_empty() {
+            status += &format!("; {} samples not found", report.missing.len());
         }
         self.status = status;
     }
@@ -3580,6 +3624,11 @@ impl App {
                     continue;
                 }
             };
+            // MIDI recorded into another group: that group and sound have the focus.
+            if r.midi && r.velocity > 0 && r.group != self.group && self.settings.focus_follows {
+                self.focus_group(r.group);
+                self.sound = r.sound;
+            }
             // A note into a growing pattern's last bar adds the next.
             if r.velocity > 0
                 && let Some(grow) = &mut self.grow
@@ -4161,8 +4210,10 @@ impl App {
                                 rgb: layout::rgb(p, g, Some(s)),
                                 color: layout::colour_index(p, g, Some(s)),
                                 muted: snd.muted,
-                                // (A sound may only play MIDI out, with no plug-ins.)
+                                // (A sound may only play MIDI out, with no plug-ins. A Sampler
+                                // whose module didn't become a slot still has samples.)
                                 used: !snd.slots.is_empty()
+                                    || snd.sampler.as_ref().is_some_and(|sm| sm.zones.iter().any(|z| !z.sample.path.is_empty()))
                                     || !snd.name.is_empty()
                                     || snd.channel.midi_out != deckard_model::MidiDest::None
                                     || noted.contains(&s),
@@ -5137,6 +5188,7 @@ impl App {
     fn note_in(&mut self, group: usize, sound: usize, pitch: i64, velocity: i64) {
         let Some(doc) = self.doc.clone() else { return };
         let d = doc.borrow();
+        self.remember_libraries();
         let Ok(out) = self.output.get_or_insert_with(|| open_output(&self.settings, &mut self.output_fallback)) else { return };
         if out.has_engine() {
             out.live(deckard_engine::Live::NoteIn { group, sound, pitch, velocity, thru: false });
@@ -5162,6 +5214,7 @@ impl App {
     fn follow_edits(&mut self) {
         let Some(doc) = self.doc.clone() else { return };
         let d = doc.borrow();
+        self.remember_libraries();
         let Some(Ok(out)) = &self.output else { return };
         // An edit that reached the engine while it switched modes is sent again.
         let (mode, stale) = out.telemetry(|t| (t.mode, t.stale && t.actions >= self.adopt_sent));
@@ -6808,6 +6861,11 @@ impl App {
             .unwrap_or_else(|| deckard_library::user::documents().unwrap_or_default().join("Native Instruments").join("Maschine 3"))
     }
 
+    /// The sample search uses the same folders the library browser scans.
+    fn remember_libraries(&mut self) {
+        self.samples.library_dirs = self.library_roots().into_iter().map(|r| r.path).collect();
+    }
+
     /// The folders DECKARD's library indexes: Maschine's user folders (Maschine 3's,
     /// and Maschine 2's beside it), listed under User, and the library folders from
     /// Preferences, under Factory, each its folder's name (less " Library") as product.
@@ -6968,6 +7026,18 @@ impl App {
     fn browse(&mut self, a: browser::BrowseAct) {
         use browser::BrowseAct as B;
         self.browser.touch();
+        if matches!(a, B::Rescan) {
+            let roots = self.library_roots();
+            self.browser.rescan(roots);
+            self.status = "Library refreshed".into();
+            return;
+        }
+        if let B::Folder(dir) = &a
+            && !dir.is_dir()
+        {
+            self.status = format!("{} isn't a folder", dir.display());
+            return;
+        }
         let b = &mut self.browser;
         let mut q = b.query.clone();
         match a {
@@ -7078,6 +7148,7 @@ impl App {
                 }
                 return;
             }
+            B::Rescan => return,
             B::LibraryFolder(dir, on) => {
                 let folders = &mut self.settings.library_folders;
                 folders.retain(|d| *d != dir);

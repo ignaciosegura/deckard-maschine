@@ -78,8 +78,13 @@ pub const RATES: [(&str, f64); 24] = [
 /// The index in [`RATES`] of "1/4".
 pub const DEFAULT_RATE: usize = 12;
 
+/// How far the picture scrolls compared with the LFO. Slow enough to watch; the
+/// rate still shows, because a faster LFO travels further in the same time.
+const PICTURE_SCROLL: f64 = 0.125;
+
 /// One LFO: `pad` (1–16) names it; `rate` indexes [`RATES`] when `sync`, else `hz`
-/// (0.01–20); `phase` in degrees; `level` 0..1; `quantize` steps per cycle (0 off, else
+/// (0.01–20); `phase` in degrees; `level` 0..1; `offset` −1..1 shifts the wave up or
+/// down; `jitter` 0..1 mixes noise into it; `quantize` steps per cycle (0 off, else
 /// 2–32); `trigger` the (group, sound) whose notes restart it; `fade` in beats, after a
 /// trigger; `muted` silences it. `env` makes it an envelope (ADSR) its trigger's notes
 /// play (docs/superpowers/specs/2026-10-29-lfo-envelope-design.md): `attack`, `decay`,
@@ -94,6 +99,10 @@ pub struct Lfo {
     pub hz: f32,
     pub phase: f32,
     pub level: f32,
+    /// Added to the wave after level, then clipped to 0..1. 0 leaves the wave where it is.
+    pub offset: f32,
+    /// How much noise replaces the wave, 0..1. 0 is the clean shape.
+    pub jitter: f32,
     pub quantize: u8,
     pub trigger: Option<(usize, usize)>,
     pub fade: f32,
@@ -154,6 +163,8 @@ impl Lfo {
             hz: 1.0,
             phase: 0.0,
             level: 1.0,
+            offset: 0.0,
+            jitter: 0.0,
             quantize: 0,
             trigger: None,
             fade: 1.0,
@@ -244,8 +255,9 @@ impl Lfo {
         w as f32
     }
 
-    /// What it gives (0..1): the wave × level × fade. `since_trigger` is the beats since
-    /// its trigger's last note; a triggered LFO with none yet gives 0.
+    /// What it gives (0..1): the wave with jitter mixed in, × level, shifted by the
+    /// offset and clipped to 0..1, then × fade. `since_trigger` is the beats since its
+    /// trigger's last note; a triggered LFO with none yet gives 0.
     pub fn output(&self, cycles: f64, since_trigger: Option<f64>) -> f32 {
         let fade = match (self.trigger, since_trigger) {
             (None, _) => 1.0,
@@ -253,14 +265,55 @@ impl Lfo {
             (Some(_), Some(_)) if self.fade <= 0.0 => 1.0,
             (Some(_), Some(s)) => (s / f64::from(self.fade)).clamp(0.0, 1.0),
         };
-        self.wave_at(cycles) * self.level.clamp(0.0, 1.0) * fade as f32
+        self.signal(cycles) * fade as f32
     }
 
-    /// `n` samples of the output over two cycles, for drawing; a triggered LFO is drawn
-    /// from its trigger (the fade ramp shows), a cycle taken as the rate's beats (a beat
-    /// for Hz).
-    /// An envelope is drawn as its ADSR, not to time ([`Self::picture_note_off`]).
+    /// The wave after jitter, level and offset, clipped to 0..1. Jitter 0 and offset 0
+    /// leave the wave × level.
+    fn signal(&self, cycles: f64) -> f32 {
+        let wave = self.wave_at(cycles);
+        let jitter = self.jitter.clamp(0.0, 1.0);
+        let mixed = if jitter == 0.0 { wave } else { wave * (1.0 - jitter) + noise(self.pad, cycles) as f32 * jitter };
+        (mixed * self.level.clamp(0.0, 1.0) + self.offset).clamp(0.0, 1.0)
+    }
+
+    /// How many cycles the picture spans. The window is two quarter notes when synced and
+    /// two seconds when free, so a faster rate fits more waves and a slower one shows a
+    /// shorter stretch of the same wave. The display scrolls that window ([`Self::picture_at`]).
+    fn picture_cycles(&self) -> f64 {
+        if self.sync { 2.0 / self.beats() } else { 2.0 * f64::from(self.hz).max(0.0) }
+    }
+
+    /// Cycles elapsed on the display clock: `seconds` of UI time, at `bpm` when synced.
+    ///
+    /// The picture moves at an eighth of the LFO, so the two-beat window takes about
+    /// eight seconds to cross the panel instead of one. A faster rate still travels
+    /// further. The signal itself ([`Self::output`]) is not slowed.
+    pub fn display_cycles(&self, seconds: f64, bpm: f64) -> f64 {
+        let real = if self.sync { seconds * (bpm.max(1.0) / 60.0) / self.beats() } else { seconds * f64::from(self.hz).max(0.0) };
+        real * PICTURE_SCROLL
+    }
+
+    /// Kept so a picture can still ask. The time lines are gone: the wave scrolls instead,
+    /// so this is empty.
+    pub fn picture_marks(&self) -> Vec<f32> {
+        Vec::new()
+    }
+
+    /// `n` samples of the wave, for drawing, with the window's left edge at cycle 0.
+    ///
+    /// The fade is a level ramp in beats ([`Self::output`]), not part of the cycle, so
+    /// it is not drawn: folding it in made the first cycle a different shape at every
+    /// rate. The picture is the wave itself, with level, offset and jitter. A trigger
+    /// does not change it. An envelope is drawn as its ADSR, not to time
+    /// ([`Self::picture_note_off`]).
     pub fn picture(&self, n: usize) -> Vec<f32> {
+        self.picture_at(n, self.picture_cycles())
+    }
+
+    /// `n` samples across the fixed window, the right edge at cycle `at` (now). As `at`
+    /// grows the wave travels left, so the rate is visible. An envelope ignores `at`.
+    pub fn picture_at(&self, n: usize, at: f64) -> Vec<f32> {
         if self.env {
             let (a, d, s, r, total) = self.env_widths();
             let sustain = self.sustain.clamp(0.0, 1.0);
@@ -280,14 +333,21 @@ impl Lfo {
                 })
                 .collect();
         }
-        let beats = if self.sync { self.beats() } else { 1.0 };
+        let span = self.picture_cycles();
+        let start = at - span;
         (0..n)
             .map(|i| {
-                let c = 2.0 * i as f64 / n.max(1) as f64;
-                self.output(c, self.trigger.map(|_| c * beats))
+                let c = start + span * i as f64 / n.max(1) as f64;
+                self.signal(c)
             })
             .collect()
     }
+}
+
+/// Noise for [`Lfo::jitter`]: a new value many times a cycle, steady between them.
+/// A different pad from [`random`] so it doesn't copy a Random wave.
+fn noise(pad: u8, cycles: f64) -> f64 {
+    random(pad.wrapping_add(19), (cycles * 48.0).floor() as i64)
 }
 
 /// A repeatable value (0..1) for a pad's Random LFO in `cycle`.
@@ -302,13 +362,14 @@ fn random(pad: u8, cycle: i64) -> f64 {
 /// LFOs as text: one per line, `pad shape sync rate hz phase level quantize fade trig`,
 /// `sync` 0 or 1 and `trig` `-` or `group:sound`, then `muted` for a muted one, `env`
 /// for an envelope, and its settings `a=` `d=` `s=` `r=` (seconds; sustain 0..1) `rt=`
-/// (retrigger 0 or 1), kept in either mode (words older readers skip).
+/// (retrigger 0 or 1), `off=` (−1..1) and `jit=` (0..1), kept in either mode (words
+/// older readers skip).
 pub fn to_text(lfos: &[Lfo]) -> String {
     let mut s = String::new();
     for l in lfos {
         let trig = l.trigger.map_or("-".to_string(), |(g, k)| format!("{g}:{k}"));
         s.push_str(&format!(
-            "{} {} {} {} {} {} {} {} {} {trig}{}{} a={} d={} s={} r={} rt={}\n",
+            "{} {} {} {} {} {} {} {} {} {trig}{}{} a={} d={} s={} r={} rt={} off={} jit={}\n",
             l.pad,
             l.shape.key(),
             u8::from(l.sync),
@@ -325,6 +386,8 @@ pub fn to_text(lfos: &[Lfo]) -> String {
             l.sustain,
             l.release,
             u8::from(l.retrigger),
+            l.offset,
+            l.jitter,
         ));
     }
     s
@@ -376,6 +439,10 @@ fn line(l: &str) -> Option<Lfo> {
                     l.release = time(v);
                 } else if let Some(v) = num("rt=") {
                     l.retrigger = v != 0.0;
+                } else if let Some(v) = num("off=") {
+                    l.offset = v.clamp(-1.0, 1.0);
+                } else if let Some(v) = num("jit=") {
+                    l.jitter = v.clamp(0.0, 1.0);
                 }
             }
         }
@@ -414,6 +481,8 @@ mod tests {
             quantize: 8,
             trigger: Some((1, 2)),
             fade: 2.0,
+            offset: -0.25,
+            jitter: 0.4,
             ..Lfo::new(5)
         };
         let v = vec![Lfo::new(1), b];
@@ -625,9 +694,84 @@ mod tests {
     fn picture_draws_two_cycles() {
         let p = Lfo::new(1).picture(8);
         assert_eq!(p.len(), 8);
-        assert!(close(p[0], 0.5));
-        let t = Lfo { shape: Shape::Square, trigger: Some((0, 0)), ..Lfo::new(1) }.picture(8);
-        assert!(t[0] < t[1], "the fade ramp shows");
+        assert!(close(p[0], 0.5), "a 1/4 sine still starts mid-wave");
+        assert!(close(p[1], 1.0), "two cycles across the picture: the top is the second sample");
+        // A trigger does not reshape the wave. The rate does change how many waves fit.
+        let wave = Lfo { shape: Shape::Square, ..Lfo::new(1) }.picture(8);
+        let triggered = Lfo { shape: Shape::Square, trigger: Some((0, 0)), ..Lfo::new(1) }.picture(8);
+        let eighth = RATES.iter().position(|r| r.0 == "1/8").unwrap();
+        let faster = Lfo { shape: Shape::Square, rate: eighth, ..Lfo::new(1) }.picture(8);
+        assert_eq!(triggered, wave);
+        assert_ne!(faster, wave, "1/8 draws twice as many waves as 1/4");
+        assert!(close(wave[0], 1.0));
+        let hz = |h| Lfo { shape: Shape::Square, sync: false, hz: h, ..Lfo::new(1) }.picture(8);
+        assert_ne!(hz(1.0), hz(2.0), "Hz changes the frequency too");
+    }
+
+    fn at_rate(name: &str) -> Lfo {
+        Lfo { rate: RATES.iter().position(|r| r.0 == name).unwrap(), ..Lfo::new(1) }
+    }
+
+    #[test]
+    fn a_slow_rate_shows_a_short_stretch() {
+        let quarter = at_rate("1/4").picture(240);
+        let slow = at_rate("4 bars").picture(240);
+        assert_ne!(slow, quarter, "two beats of a 4-bar wave is a short stretch, not two cycles");
+        assert!(slow.iter().all(|v| (v - 0.5).abs() < 0.45), "that stretch stays near the sine's start");
+        let free = |hz| Lfo { sync: false, hz, ..Lfo::new(1) }.picture(8);
+        assert_ne!(free(0.01), free(1.0), "a slow free rate shows less of the wave");
+    }
+
+    #[test]
+    fn the_picture_scrolls_slower_than_the_lfo() {
+        let l = Lfo::new(1);
+        // One second at 120 BPM is two quarter notes: two real cycles of a 1/4 LFO.
+        let shown = l.display_cycles(1.0, 120.0);
+        assert!(shown < 0.5, "a second of the picture moves less than half a cycle, got {shown}");
+        let eighth = RATES.iter().position(|r| r.0 == "1/8").unwrap();
+        let faster = Lfo { rate: eighth, ..Lfo::new(1) }.display_cycles(1.0, 120.0);
+        assert!(faster > shown, "a faster rate still travels further");
+        let free = Lfo { sync: false, hz: 1.0, ..Lfo::new(1) };
+        assert!(free.display_cycles(1.0, 120.0) < 0.5);
+    }
+
+    #[test]
+    fn the_picture_scrolls_and_has_no_time_lines() {
+        let l = Lfo::new(1);
+        let still = l.picture(8);
+        let later = l.picture_at(8, 2.25);
+        assert!(close(later[0], still[1]), "a quarter cycle later, the wave has moved left");
+        assert!(l.picture_marks().is_empty());
+        assert!(at_rate("4 bars").picture_marks().is_empty());
+        assert!(Lfo { sync: false, hz: 0.01, ..Lfo::new(1) }.picture_marks().is_empty());
+        assert!(Lfo { env: true, ..Lfo::new(1) }.picture_marks().is_empty());
+    }
+
+    #[test]
+    fn offset_shifts_and_clips_the_signal() {
+        assert!(close(Lfo { offset: 0.25, ..Lfo::new(1) }.output(0.0, None), 0.75));
+        assert!(close(Lfo { offset: 1.0, ..Lfo::new(1) }.output(0.0, None), 1.0));
+        assert!(close(Lfo { offset: -1.0, ..Lfo::new(1) }.output(0.0, None), 0.0));
+        assert!(close(Lfo { offset: 0.25, ..Lfo::new(1) }.picture(8)[0], 0.75));
+    }
+
+    #[test]
+    fn jitter_mixes_noise_into_the_signal() {
+        let clean = Lfo::new(1).output(0.3, None);
+        assert!(close(Lfo { jitter: 0.0, ..Lfo::new(1) }.output(0.3, None), clean));
+        let rough = Lfo { jitter: 1.0, ..Lfo::new(1) };
+        let a = rough.output(0.0, None);
+        let b = rough.output(1.0, None);
+        assert_ne!(a, b, "full jitter is noise, and it changes along the wave");
+        assert!((0.0..=1.0).contains(&a) && (0.0..=1.0).contains(&b));
+        let mild = Lfo { jitter: 0.05, ..Lfo::new(1) }.output(0.0, None);
+        assert!((mild - 0.5).abs() < 0.05, "a little jitter stays near the sine");
+    }
+
+    #[test]
+    fn old_lfo_text_without_offset_or_jitter_still_loads() {
+        let l = from_text("1 sine 1 12 1 0 1 0 1 - a=0.01 d=0.3 s=0.5 r=0.3 rt=1\n");
+        assert_eq!(l, vec![Lfo::new(1)]);
     }
 
     #[test]

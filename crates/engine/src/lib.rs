@@ -1180,6 +1180,8 @@ pub struct Recorded {
     /// Ticks on a clock that never wraps (loops and jumps don't move it back): what a
     /// held note's length is measured by.
     pub played: f64,
+    /// It came in over MIDI (not from a pad, Note Repeat or the Arp).
+    pub midi: bool,
 }
 
 /// Per-note expression played while recording, at the song position it came.
@@ -1521,6 +1523,8 @@ fn input_routes(p: &Project) -> Vec<InRoute> {
 #[derive(Default)]
 pub struct SampleCache {
     by_path: HashMap<std::path::PathBuf, Option<Arc<Sample>>>,
+    /// Library folders added in Preferences, searched with the installed ones.
+    pub library_dirs: Vec<std::path::PathBuf>,
     /// Where samples were found (by how the project refers to them, and the project's
     /// folder): each edit doesn't search the disk again. Only files found are kept.
     found: HashMap<(i64, String, String, String, Option<std::path::PathBuf>), std::path::PathBuf>,
@@ -1531,7 +1535,9 @@ pub struct SampleCache {
 impl SampleCache {
     /// The sample `sample` (as a project refers to it) decoded, loading it if needed.
     pub fn sample(&mut self, sample: &deckard_model::SampleRef, project_path: Option<&Path>) -> Option<Arc<Sample>> {
-        let path = library::Resolver::new(project_path).resolve(sample)?;
+        let mut resolver = library::Resolver::new(project_path);
+        resolver.set_extra(&self.library_dirs);
+        let path = resolver.resolve(sample)?;
         self.by_path
             .entry(path.clone())
             .or_insert_with(|| Sample::load(&path).ok().filter(|s| !s.frames.is_empty() && s.rate > 0).map(Arc::new))
@@ -1579,6 +1585,7 @@ impl Engine {
     ) -> (Engine, LoadReport) {
         let mut report = LoadReport::default();
         let mut resolver = library::Resolver::new(project_path);
+        resolver.set_extra(&cache.library_dirs);
         let mut samples: Vec<Arc<Sample>> = Vec::new();
         let mut index: HashMap<*const Sample, usize> = HashMap::new();
         let sr_f = sr as f64;
@@ -3474,6 +3481,7 @@ impl Engine {
                 }
                 _ => {}
             }
+            let midi = matches!(event, Live::NoteIn { .. });
             let note = match event {
                 Live::NoteOn { group, sound, pitch, velocity, length } => Some((group, sound, pitch, velocity, length)),
                 Live::NoteIn { group, sound, pitch, velocity, .. } => Some((group, sound, pitch, velocity, i64::MAX)),
@@ -3483,7 +3491,7 @@ impl Engine {
             if let Some((group, sound, pitch, velocity, length)) = note
                 && self.recorded.len() < RECORDED_ROOM
             {
-                self.recorded.push(Recorded { group, sound, pitch, velocity, length, tick, mode, seq, played });
+                self.recorded.push(Recorded { group, sound, pitch, velocity, length, tick, mode, seq, played, midi });
             }
         }
         match event {
@@ -5329,6 +5337,20 @@ mod tests {
         e.schedule(0, Live::NoteIn { group: 2, sound: 3, pitch: 40, velocity: 30, thru: false });
         e.process(&mut out);
         assert_eq!(e.live_hit, (2, 2, 3, 40, 30));
+    }
+
+    /// What's recorded says whether it came in over MIDI.
+    #[test]
+    fn a_recorded_note_says_if_it_was_midi() {
+        let mut e = click_engine(1000);
+        e.set_recording(true);
+        let mut out = vec![0f32; 512];
+        e.schedule(0, Live::NoteOn { group: 0, sound: 1, pitch: 72, velocity: 90, length: PPQ });
+        e.schedule(0, Live::NoteIn { group: 0, sound: 0, pitch: 40, velocity: 30, thru: false });
+        e.process(&mut out);
+        let by_pitch = |p: i64| e.recorded.iter().find(|r| r.pitch == p).expect("recorded");
+        assert!(!by_pitch(72).midi, "a pad");
+        assert!(by_pitch(40).midi);
     }
 
     #[test]

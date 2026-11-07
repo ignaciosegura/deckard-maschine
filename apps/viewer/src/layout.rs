@@ -1339,6 +1339,27 @@ fn dark_style(ctx: &egui::Context) {
     });
 }
 
+/// Draws the browser header icon (three equidistant shelf lines on the left and a magnifying glass on the right).
+fn draw_browser_icon(p: &Painter, r: Rect, c: Color32) {
+    let x0 = (r.center().x - 9.0).floor() + 0.5;
+    for i in 0..3 {
+        let x = x0 + i as f32 * 3.0;
+        p.vline(x, (r.center().y - 6.0)..=(r.center().y + 6.0), Stroke::new(1.0, c));
+    }
+    p.circle_stroke(r.center() + Vec2::new(5.5, -1.0), 3.5, Stroke::new(1.2, c));
+    p.line_segment([r.center() + Vec2::new(8.0, 1.5), r.center() + Vec2::new(10.0, 4.5)], Stroke::new(1.5, c));
+}
+
+/// Draws the mixer header icon (three vertical fader tracks with pixel-centred fader caps).
+fn draw_mixer_icon(p: &Painter, r: Rect, c: Color32) {
+    for i in 0..3 {
+        let x = (r.center().x - 6.0 + i as f32 * 6.0).floor() + 0.5;
+        p.vline(x, (r.center().y - 7.0)..=(r.center().y + 7.0), Stroke::new(1.0, c));
+        let y = r.center().y + [3.0, -3.0, 1.0][i];
+        p.rect_filled(Rect::from_center_size(Pos2::new(x, y), Vec2::new(5.0, 2.5)), 0.5, c);
+    }
+}
+
 /// A 32×24-style button drawing its own icon; `on` lights it in `on_color`.
 fn icon_button(ui: &mut Ui, size: Vec2, on: bool, on_color: Color32, tip: &str, draw: impl FnOnce(&Painter, Rect, Color32)) -> Response {
     let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
@@ -1416,32 +1437,15 @@ pub fn header(app: &mut App, ui: &mut Ui) {
                 app.menu_commands.extend(chosen);
                 ui.add_space(2.0);
                 // The browser (F4): a magnifier over a shelf.
-                if icon_button(ui, Vec2::new(32.0, 24.0), app.browser.open, white(245), "Show or hide the browser (F4)", |p, r, c| {
-                    for i in 0..3 {
-                        let x = r.center().x - 7.0 + i as f32 * 4.0;
-                        p.vline(x, (r.center().y - 6.0)..=(r.center().y + 6.0), Stroke::new(1.5, c));
-                    }
-                    p.circle_stroke(r.center() + Vec2::new(5.0, -1.0), 3.5, Stroke::new(1.2, c));
-                    p.line_segment([r.center() + Vec2::new(7.5, 1.5), r.center() + Vec2::new(9.5, 4.5)], Stroke::new(1.5, c));
-                })
-                .clicked()
+                if icon_button(ui, Vec2::new(32.0, 24.0), app.browser.open, white(245), "Show or hide the browser (F4)", draw_browser_icon)
+                    .clicked()
                 {
                     acts.push(Act::Browse(crate::browser::BrowseAct::Toggle));
                 }
                 ui.add_space(2.0);
                 if app.doc.is_some() {
                     let on = app.mixer;
-                    if icon_button(ui, Vec2::new(32.0, 24.0), on, white(245), "Show or hide the Mixer", |p, r, c| {
-                        // Three faders.
-                        for i in 0..3 {
-                            let x = r.center().x - 6.0 + i as f32 * 6.0;
-                            p.vline(x, (r.center().y - 7.0)..=(r.center().y + 7.0), Stroke::new(1.0, c));
-                            let y = r.center().y + [3.0, -3.0, 1.0][i];
-                            p.rect_filled(Rect::from_center_size(Pos2::new(x, y), Vec2::new(4.0, 2.5)), 0.5, c);
-                        }
-                    })
-                    .clicked()
-                    {
+                    if icon_button(ui, Vec2::new(32.0, 24.0), on, white(245), "Show or hide the Mixer", draw_mixer_icon).clicked() {
                         acts.push(Act::ToggleMixer);
                     }
                     ui.add_space(4.0);
@@ -2830,11 +2834,21 @@ fn name_rect(row: Rect) -> Rect {
 pub const DROP_ROWS: &str = "deckard-drop-rows";
 
 fn row_input(ui: &mut Ui, app: &App, p: &Project, row: Rect, clip: Rect, target: Target, name: &str, focus: Act, acts: &mut Vec<Act>) {
-    // A sound row takes samples dragged onto it: lit while they're over it.
-    if let Target::Sound(g, s) = target {
+    // A sound row takes a sample dropped on that pad. A group row takes one into the
+    // focused pad of that group (the first pad, when another group is focused).
+    let drop_at = match target {
+        Target::Sound(g, s) => Some((g, s)),
+        Target::Group(g) => Some((g, if app.group == g { app.sound } else { 0 })),
+        _ => None,
+    };
+    if let Some((g, s)) = drop_at {
         let r = row.intersect(clip);
         ui.ctx().data_mut(|d| d.get_temp_mut_or_default::<Vec<(Rect, (usize, usize))>>(egui::Id::new(DROP_ROWS)).push((r, (g, s))));
-        if app.file_drag.is_some_and(|at| r.contains(at)) {
+        let over = app.file_drag.is_some_and(|at| r.contains(at))
+            || ui.input(|i| i.pointer.hover_pos()).is_some_and(|p| r.contains(p))
+                && (egui::DragAndDrop::payload::<crate::layout::browser::Dragged>(ui.ctx()).is_some()
+                    || egui::DragAndDrop::payload::<crate::layout::browser::DraggedFile>(ui.ctx()).is_some());
+        if over {
             ui.painter().rect_stroke(r.shrink(1.0), 2.0, Stroke::new(2.0, Color32::WHITE), StrokeKind::Inside);
         }
     }
@@ -4123,7 +4137,9 @@ fn chain_area(ui: &mut Ui, app: &App, doc: &deckard_doc::Document, rect: Rect, a
                     mod_routes::set_bases(ui, bases);
                     let smp = &*live;
                     let page = app.sampler_page.min(sampler_ui::PAGES.len() - 1);
-                    heading = format!("Sampler: {}", sampler_ui::PAGES[page]);
+                    // The open page is already a tab. Putting it in the title too
+                    // ("Sampler: Pitch / Envelope") shifts the whole tab bar on every click.
+                    heading = "Sampler".into();
                     let pg = sampler_ui::page(smp, app.group, app.sound, page);
                     params = pg.slots.into_iter().collect();
                     sections = pg.sections.into_iter().map(|(i, n)| (i, n.into())).collect();
@@ -4156,11 +4172,9 @@ fn chain_area(ui: &mut Ui, app: &App, doc: &deckard_doc::Document, rect: Rect, a
                         Some(v) if v.error.is_none() => {
                             let pages = v.pages.len().max(1);
                             let page = app.plugin_page.min(pages - 1);
-                            let pname = v.pages.get(page).map(|p| p.name.clone()).filter(|n| !n.is_empty());
-                            heading = match pname {
-                                Some(n) => format!("{}: {n}", pr.name),
-                                None => format!("{}: Page {} of {}", pr.name, page + 1, pages),
-                            };
+                            // The page names are the tabs beside this. The title stays the
+                            // plug-in, so the bar doesn't jump when the page changes.
+                            heading = pr.name.clone();
                             // Named pages (DECKARD's plug-ins name theirs) by name, else by number.
                             let names: Vec<String> = if !v.pages.is_empty() && v.pages.iter().all(|p| !p.name.is_empty()) {
                                 v.pages.iter().map(|p| p.name.clone()).collect()
@@ -4217,7 +4231,9 @@ fn chain_area(ui: &mut Ui, app: &App, doc: &deckard_doc::Document, rect: Rect, a
                     // its knobs now.
                     let names = crate::module_ui::pages(&slot.module).unwrap_or(&[]);
                     let page = app.plugin_page.min(names.len().saturating_sub(1));
-                    heading = format!("{}: {}", slot.name, names[page]);
+                    // Several pages become tabs, so the title is only the module.
+                    // One page has no tab, and its name stays in the title.
+                    heading = if names.len() > 1 { slot.name.clone() } else { format!("{}: {}", slot.name, names[page]) };
                     let t = app.module_target(i);
                     let (live, bases) = app.live_slot_bases((app.group, app.sound, i), s, slot, t);
                     mod_routes::set_bases(ui, bases);
@@ -6971,6 +6987,82 @@ mod theme_tests {
         assert!(visuals.dark_mode);
         for fill in [visuals.window_fill, visuals.panel_fill, visuals.extreme_bg_color, visuals.widgets.inactive.weak_bg_fill] {
             assert!(bright(fill) < 300, "{fill:?} under white text");
+        }
+    }
+}
+
+#[cfg(test)]
+mod header_icon_tests {
+    use super::*;
+
+    #[test]
+    fn browser_icon_separates_magnifying_glass_from_shelf_lines() {
+        let ctx = egui::Context::default();
+        let rect = Rect::from_min_size(Pos2::new(100.0, 8.0), Vec2::new(32.0, 24.0));
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+            draw_browser_icon(ui.painter(), rect, Color32::WHITE);
+        });
+        out.textures_delta.clear();
+        let shapes = out.shapes;
+        let mut vlines = Vec::new();
+        let mut rightmost_line_edge = f32::NEG_INFINITY;
+        let mut circle_left_edge = None;
+        for clipped in shapes {
+            match clipped.shape {
+                egui::Shape::LineSegment { points, stroke } if (points[0].x - points[1].x).abs() < 1e-4 => {
+                    let snapped_x = (points[0].x - 0.5).round() + 0.5;
+                    vlines.push(snapped_x);
+                    rightmost_line_edge = rightmost_line_edge.max(snapped_x + stroke.width * 0.5);
+                }
+                egui::Shape::Circle(c) => {
+                    circle_left_edge = Some(c.center.x - c.radius - c.stroke.width * 0.5);
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(vlines.len(), 3, "three vertical shelf lines");
+        let d01 = vlines[1] - vlines[0];
+        let d12 = vlines[2] - vlines[1];
+        assert!((d01 - d12).abs() < 1e-4, "shelf lines should be equidistant: {d01} vs {d12}");
+        let circle_left = circle_left_edge.expect("magnifying glass circle painted");
+        assert!(
+            circle_left - rightmost_line_edge >= 2.0,
+            "magnifying glass left edge ({circle_left}) should clear shelf lines ({rightmost_line_edge}) by at least 2px"
+        );
+    }
+
+    #[test]
+    fn mixer_icon_centres_fader_knobs_on_vertical_lines() {
+        let ctx = egui::Context::default();
+        let rect = Rect::from_min_size(Pos2::new(140.0, 8.0), Vec2::new(32.0, 24.0));
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+            draw_mixer_icon(ui.painter(), rect, Color32::WHITE);
+        });
+        out.textures_delta.clear();
+        let shapes = out.shapes;
+        let mut lines = Vec::new();
+        let mut knobs = Vec::new();
+        for clipped in shapes {
+            match clipped.shape {
+                egui::Shape::LineSegment { points, stroke } if (points[0].x - points[1].x).abs() < 1e-4 => {
+                    // epaint snaps 1px vertical lines to pixel centers (x - 0.5).round() + 0.5
+                    let snapped_x = (points[0].x - 0.5).round() + 0.5;
+                    lines.push((snapped_x - stroke.width * 0.5, snapped_x + stroke.width * 0.5));
+                }
+                egui::Shape::Rect(r) => {
+                    // epaint snaps rect edges to integer pixel boundaries
+                    knobs.push((r.rect.min.x.round(), r.rect.max.x.round()));
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(lines.len(), 3);
+        assert_eq!(knobs.len(), 3);
+        for ((line_l, line_r), (knob_l, knob_r)) in lines.into_iter().zip(knobs) {
+            let left_overhang = line_l - knob_l;
+            let right_overhang = knob_r - line_r;
+            assert!((left_overhang - right_overhang).abs() < 1e-4, "left overhang {left_overhang} != right overhang {right_overhang}");
+            assert!(left_overhang >= 1.5);
         }
     }
 }
