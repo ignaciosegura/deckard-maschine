@@ -60,6 +60,7 @@ From `docs/context-menus.md` against the code:
 - **Section** (Song view): missing Create, Clear, Rename, Unique, Color, Scene Tempo. Convert to Clip(s): done.
 - **Event area** (pattern editor): done: Select/Draw/Split/Join/Mute, Quantize, Quantize 50%, Cut/Copy/Paste/Delete, Nudge Grid. Takes missing (no takes of notes).
 - **Clips:** Duplicate, Double, Delete (the Song view's clip menu); dragging moves and resizes. Missing: Clear, Rename, Color, editing a clip's notes in the pattern editor.
+- **Song view zoom:** done in the software (⌘ + scroll on a Mac, Ctrl + scroll elsewhere, pinch, sideways scroll, a zoom bar, follow playback). The MK3 zooms its own displays (knobs 5 and 6); the two are not linked.
 - **Plug-in slot menu:** Presets submenu for VST/AU presets, Save Plug-in preset.
 - **Macro parameter / page names:** done (the macro slot menu, the page tabs' menu; see Macros).
 

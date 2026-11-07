@@ -129,6 +129,7 @@ can:
 
 - add, move, duplicate and resize sections;
 - click a section to jump there when the current one ends.
+- zoom the timeline with ⌘ + scroll on a Mac, Ctrl + scroll on Windows and Linux (or pinch), round the pointer, scroll sideways to move along it, or use the zoom bar under the tracks (drag it to scroll, drag its ends to zoom, double-click it to show the whole song). While the song plays, the view follows the playhead.
 
 ### Piano roll
 

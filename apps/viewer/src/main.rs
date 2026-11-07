@@ -12834,6 +12834,46 @@ mod tests {
         }
     }
 
+    /// ⌘/Ctrl + scroll in the Song view zooms the timeline round the pointer, the zoom
+    /// bar and a sideways scroll move along it, and dragging a section's edge still
+    /// lands on whole bars while zoomed.
+    #[test]
+    fn song_view_zooms_the_timeline() {
+        let Some(mut h) = harness(false, true) else { return };
+        h.state_mut().song_view = true;
+        h.run_steps(3);
+        let rect =
+            |h: &Harness<'static, App>, key: (&str, usize)| -> egui::Rect { h.ctx.data(|d| d.get_temp(egui::Id::new(key))).unwrap() };
+        let window =
+            |h: &Harness<'static, App>| -> (f32, f32) { h.ctx.data(|d| d.get_temp(egui::Id::new("song-hzoom"))).unwrap_or((0.0, 1.0)) };
+        assert_eq!(window(&h), (0.0, 1.0), "the whole arrangement at first");
+        let before = rect(&h, ("deckard-section", 0));
+        // ⌘ + scroll over the section bar zooms in, round the pointer.
+        let at = egui::pos2(before.left() + 1.0, before.center().y);
+        h.hover_at(at);
+        h.step();
+        h.event(Event::Zoom(2.0));
+        h.run_steps(2);
+        let (from, len) = window(&h);
+        assert!((len - 0.5).abs() < 0.01, "zoomed in: {len}");
+        let zoomed = rect(&h, ("deckard-section", 0));
+        assert!((zoomed.width() / before.width() - 2.0).abs() < 0.05, "twice as wide: {before:?} {zoomed:?}");
+        assert!((zoomed.left() - before.left()).abs() < 2.0, "the pointer's bar stays put: {before:?} {zoomed:?}");
+        assert!(from >= 0.0);
+        // A section's right edge still lands on whole bars: one bar longer.
+        let bar = project_of(&h).bar_length();
+        let l0 = project_of(&h).sections[0].length;
+        let per_bar = zoomed.width() / (l0 as f32 / bar as f32);
+        drag(&mut h, egui::pos2(zoomed.right(), zoomed.center().y), egui::pos2(zoomed.right() + per_bar, zoomed.center().y));
+        assert_eq!(project_of(&h).sections[0].length, l0 + bar, "one bar longer, zoomed");
+        // Zooming out all the way shows the whole arrangement again.
+        h.hover_at(at);
+        h.step();
+        h.event(Event::Zoom(0.1));
+        h.run_steps(2);
+        assert_eq!(window(&h), (0.0, 1.0), "back to the whole");
+    }
+
     /// Drag a scene tab to move the scene; drag a section's header to move it, its
     /// right edge to change its length.
     #[test]

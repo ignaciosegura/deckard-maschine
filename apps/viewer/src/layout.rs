@@ -3076,7 +3076,7 @@ fn song_view(ui: &mut Ui, app: &App, p: &Project, rect: Rect, head: Option<Playh
     label(&painter, title, 8.0, "Song", 15.0, white(245));
     let rows_top = col.top() + 50.0;
     let rows = Rect::from_min_max(Pos2::new(rect.left(), rows_top), rect.max);
-    let y0 = scroll(ui, "song-rows", rows, (p.groups.len() + 1) as f32 * ROW);
+    let y0 = scroll(ui, "song-rows", rows, (p.groups.len() + 1) as f32 * ROW + ZOOM_BAR);
     let row_painter = painter.with_clip_rect(Rect::from_min_max(Pos2::new(col.left(), rows_top), col.max));
     for g in 0..p.groups.len() {
         let r = Rect::from_min_size(Pos2::new(col.left(), rows_top + g as f32 * ROW - y0), Vec2::new(COLUMN, ROW));
@@ -3121,24 +3121,77 @@ fn song_view(ui: &mut Ui, app: &App, p: &Project, rect: Rect, head: Option<Playh
     let bar = p.bar_length().max(1) as f32;
     let clips_end = p.groups.iter().flat_map(|g| &g.clips).map(|c| c.position + c.length).max().unwrap_or(0);
     let total = p.arrangement_length().max(clips_end) as f32 / bar;
-    // Leave room for the "+" after the last section.
-    let ppb = ((ed.width() - 40.0) / total.max(16.0)).max(12.0);
-    let hx = hscroll(ui, "song-x", ed, total.max(16.0) * ppb);
+    // What of the arrangement is shown (horizontal zoom): from `from_f` for `len_f`, as
+    // fractions of its bars (at least 16). Whole, it fits the width less room for the "+"
+    // after the last section, but never under 12 px a bar; zoomed in, down to a beat.
+    let bars = total.max(16.0);
+    let view_w = ed.width() - 40.0;
+    let max_len = (view_w / (12.0 * bars)).min(1.0);
+    let min_len = ((PPQ * 4 / p.denominator.max(1)) as f32 / bar / bars).min(max_len);
+    let zkey = egui::Id::new("song-hzoom");
+    let (mut from_f, mut len_f) = ui.data(|d| d.get_temp::<(f32, f32)>(zkey)).unwrap_or((0.0, 1.0));
+    len_f = len_f.clamp(min_len, max_len);
+    if ui.rect_contains_pointer(ed)
+        && let Some(px) = ui.input(|i| i.pointer.hover_pos())
+    {
+        // ⌘ (Ctrl off a Mac) + scroll (and pinch) zooms round the pointer; a sideways scroll moves.
+        let (zoom, dx) = ui.input(|i| (i.zoom_delta(), i.smooth_scroll_delta.x));
+        let at = ((px.x - ed.left()) / view_w).clamp(0.0, 1.0);
+        if zoom != 1.0 {
+            let anchor = from_f + at * len_f;
+            len_f = (len_f / zoom).clamp(min_len, max_len);
+            from_f = anchor - at * len_f;
+        }
+        from_f -= dx / view_w * len_f;
+    }
+    from_f = from_f.clamp(0.0, 1.0 - len_f);
+    let zoom_track = Rect::from_min_max(Pos2::new(ed.left(), ed.bottom() - ZOOM_BAR), ed.max);
+    if let Some((f, l)) = zoom_bar(ui, &painter, zkey.with("bar"), zoom_track, true, 1.0, (from_f, len_f), min_len, true) {
+        (from_f, len_f) = (f, l.clamp(min_len, max_len));
+        from_f = from_f.clamp(0.0, 1.0 - len_f);
+    }
+    // Follow playback: zoomed in, the view turns the page when the playhead leaves it.
+    if app.follow
+        && len_f < max_len
+        && let Some(h) = head.filter(|h| h.mode == Mode::Arrangement)
+    {
+        let at = (h.position / (bars as f64 * bar as f64)) as f32;
+        if at < from_f || at >= from_f + len_f {
+            from_f = ((at / len_f).floor() * len_f).clamp(0.0, 1.0 - len_f);
+        }
+    }
+    ui.data_mut(|d| d.insert_temp(zkey, (from_f, len_f)));
+    let ppb = view_w / (len_f * bars);
+    let hx = from_f * bars * ppb;
     let x_of = |ticks: f64| ed.left() + ticks as f32 / bar * ppb - hx;
     let secs = Rect::from_min_size(ed.min, Vec2::new(ed.width(), 32.0));
     ui.data_mut(|d| d.insert_temp(egui::Id::new("deckard-sections"), secs));
     let timeline = Rect::from_min_size(Pos2::new(ed.left(), secs.bottom()), Vec2::new(ed.width(), 18.0));
-    let tracks = Rect::from_min_max(Pos2::new(ed.left(), rows_top), ed.max);
-    let ep = painter.with_clip_rect(ed);
+    let tracks = Rect::from_min_max(Pos2::new(ed.left(), rows_top), Pos2::new(ed.right(), ed.bottom() - ZOOM_BAR));
+    let ep = painter.with_clip_rect(Rect::from_min_max(ed.min, tracks.max));
     ep.hline(timeline.x_range(), timeline.top(), Stroke::new(1.0, Color32::BLACK));
     ep.hline(timeline.x_range(), timeline.bottom(), Stroke::new(1.0, Color32::BLACK));
     let end_x = x_of(p.arrangement_length() as f64);
     ep.rect_filled(Rect::from_min_max(Pos2::new(end_x, tracks.top()), tracks.max), 0.0, S00);
     // Bars and beats.
     let step = (40.0 / ppb).ceil().max(1.0) as i64;
-    for b in 0..=(total.max(16.0) as i64) {
+    let beat = PPQ * 4 / p.denominator.max(1);
+    let beats = (bar as i64 / beat).max(1);
+    let show_beats = ppb / beats as f32 > 12.0;
+    for b in 0..=(bars as i64) {
         let x = x_of(b as f64 * bar as f64);
         ep.vline(x, tracks.y_range(), Stroke::new(1.0, white(20)));
+        if show_beats && b < bars as i64 {
+            for k in 1..beats {
+                let bx = x_of((b * bar as i64 + k * beat) as f64);
+                ep.vline(bx, tracks.y_range(), Stroke::new(1.0, white(10)));
+                ep.vline(
+                    bx,
+                    Rect::from_min_max(Pos2::new(0.0, timeline.top() + 10.0), timeline.max).y_range(),
+                    Stroke::new(1.0, white(40)),
+                );
+            }
+        }
         if b % step == 0 {
             ep.vline(x, timeline.y_range(), Stroke::new(1.0, white(40)));
             ep.text(Pos2::new(x + 6.0, timeline.center().y - 1.0), Align2::LEFT_CENTER, (b + 1).to_string(), font(12.0), white(142));
@@ -3328,7 +3381,7 @@ fn song_view(ui: &mut Ui, app: &App, p: &Project, rect: Rect, head: Option<Playh
     }
     if let Some(h) = head.filter(|h| h.mode == Mode::Arrangement) {
         let x = x_of(h.position);
-        ep.vline(x, Rect::from_min_max(timeline.min, ed.max).y_range(), Stroke::new(1.0, Color32::WHITE));
+        ep.vline(x, Rect::from_min_max(timeline.min, tracks.max).y_range(), Stroke::new(1.0, Color32::WHITE));
     }
 }
 
